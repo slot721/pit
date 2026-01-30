@@ -495,30 +495,58 @@ def main() -> int:
     # -------------------
     print("[FLATTEN] reduce-only market close")
 
-    # 🔑 REQUIRED on Hyperliquid
-    best_effort_cancel_all(ex, sym_ccxt)
-    time.sleep(0.3)
+    # 1) Cancel ALL exits (trigger orders) using frontendOpenOrders
+    n = cancel_and_wait_no_open_orders(ex=ex, symbol=sym_ccxt, user_addr=user_addr)
+    print(f"[FLATTEN] cancelled_open_orders={n}")
+    time.sleep(0.2)
+
+    # 2) Re-read position truth and derive close side/qty from reality
+    pos_now = get_user_positions(user_addr, timeout=args.timeout) or []
+    pos_qty_signed = extract_signed_pos_qty(pos_now, coin)
+    print(f"[FLATTEN] pos_qty_signed={pos_qty_signed}")
+
+    if abs(pos_qty_signed) <= 0:
+        print("[FLATTEN] position already flat; skipping close")
+        return 0
+
+    close_side: OrderSide = "buy" if pos_qty_signed < 0 else "sell"
+    qty_close = abs(pos_qty_signed)  # close exactly what exists
 
     mid_flat = float(get_all_mids(timeout=args.timeout).get(coin, 0.0) or px)
-    flat = flatten_reduce_only(ex, sym_ccxt, exit_side, exit_qty, mid_now=mid_flat)
+
+    # 3) Try flatten; if HL complains, do one more cancel+retry (race safety)
+    try:
+        flat = flatten_reduce_only(ex, sym_ccxt, close_side, qty_close, mid_now=mid_flat)
+    except Exception as e:
+        msg = str(e)
+        if "Reduce only order would increase position" in msg:
+            print("[FLATTEN] HL reduceOnly conflict; cancel+retry once")
+            cancel_and_wait_no_open_orders(ex=ex, symbol=sym_ccxt, user_addr=user_addr)
+            time.sleep(0.2)
+
+            pos_now = get_user_positions(user_addr, timeout=args.timeout) or []
+            pos_qty_signed = extract_signed_pos_qty(pos_now, coin)
+            if abs(pos_qty_signed) <= 0:
+                print("[FLATTEN] position already flat after retry; done")
+                return 0
+
+            close_side = "buy" if pos_qty_signed < 0 else "sell"
+            qty_close = abs(pos_qty_signed)
+            mid_flat = float(get_all_mids(timeout=args.timeout).get(coin, 0.0) or px)
+            flat = flatten_reduce_only(ex, sym_ccxt, close_side, qty_close, mid_now=mid_flat)
+        else:
+            raise
 
     ok_f, msg_f, _ = assert_hl_order(flat, name="FLATTEN", expect="FILLED")
     print(msg_f)
 
     # cleanup safety
-    best_effort_cancel_all(ex, sym_ccxt)
-    time.sleep(0.5)
+    cancel_and_wait_no_open_orders(ex=ex, symbol=sym_ccxt, user_addr=user_addr)
+    time.sleep(0.3)
+
     pos2 = get_user_positions(user_addr, timeout=args.timeout)
     foo2 = get_frontend_open_orders(user_addr, timeout=args.timeout)
     print(f"[AFTER FLATTEN] positions_nonzero={len(pos2)} open_orders={len(foo2)}")
-    if args.show_all:
-        print("positions=", fmt_json(pos2))
-        print("orders=", fmt_json(foo2))
-
-    # after flatten (cleanup)
-    best_effort_cancel_all(ex, sym_ccxt)
-    time.sleep(0.5)
-    return 0
 
 T = TypeVar("T")
 
@@ -645,6 +673,61 @@ def flatten_reduce_only(
             params={"reduceOnly": True},
         )
     return hl_with_slippage_retry(ex, _do, name="FLATTEN")
+
+def cancel_and_wait_no_open_orders(
+    *,
+    ex: ccxt.Exchange,
+    symbol: str,
+    user_addr: str,
+    timeout_s: float = 3.0,
+    poll_s: float = 0.25,
+) -> int:
+    """
+    HL robust cancel:
+      - Pull open orders from frontendOpenOrders (sees trigger orders)
+      - Cancel by oid via ccxt.cancel_order
+      - Wait until frontendOpenOrders is empty
+    """
+    import time
+
+    cancelled = 0
+    t0 = time.time()
+
+    while time.time() - t0 < timeout_s:
+        oo = get_frontend_open_orders(user_addr, timeout=10) or []
+        oids = [str(r.get("oid") or r.get("id") or "").strip() for r in oo]
+        oids = [x for x in oids if x]
+
+        if not oids:
+            return cancelled
+
+        for oid in oids:
+            try:
+                ex.cancel_order(oid, symbol)
+                cancelled += 1
+            except Exception:
+                pass
+
+        time.sleep(poll_s)
+
+    # final state (non-fatal, but print for debugging)
+    oo = get_frontend_open_orders(user_addr, timeout=10) or []
+    print(f"[CANCEL] WARN still open_orders={len(oo)} after cancel+wait")
+    return cancelled
+
+def extract_signed_pos_qty(pos_rows: list[dict], coin: str) -> float:
+    c = coin.upper()
+    for r in pos_rows or []:
+        sym = str(r.get("coin") or r.get("symbol") or r.get("asset") or "").upper()
+        if sym != c:
+            continue
+        for k in ("szi", "size", "positionSize", "qty", "sz"):
+            if k in r and r[k] is not None:
+                try:
+                    return float(r[k])
+                except Exception:
+                    pass
+    return 0.0
 
 if __name__ == "__main__":
     raise SystemExit(main())
