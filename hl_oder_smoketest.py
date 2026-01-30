@@ -494,11 +494,18 @@ def main() -> int:
     # 5) Flatten: reduce-only market opposite side
     # -------------------
     print("[FLATTEN] reduce-only market close")
+
+    # 🔑 REQUIRED on Hyperliquid
+    best_effort_cancel_all(ex, sym_ccxt)
+    time.sleep(0.3)
+
     mid_flat = float(get_all_mids(timeout=args.timeout).get(coin, 0.0) or px)
     flat = flatten_reduce_only(ex, sym_ccxt, exit_side, exit_qty, mid_now=mid_flat)
+
     ok_f, msg_f, _ = assert_hl_order(flat, name="FLATTEN", expect="FILLED")
     print(msg_f)
 
+    # cleanup safety
     best_effort_cancel_all(ex, sym_ccxt)
     time.sleep(0.5)
     pos2 = get_user_positions(user_addr, timeout=args.timeout)
@@ -507,7 +514,7 @@ def main() -> int:
     if args.show_all:
         print("positions=", fmt_json(pos2))
         print("orders=", fmt_json(foo2))
-    
+
     # after flatten (cleanup)
     best_effort_cancel_all(ex, sym_ccxt)
     time.sleep(0.5)
