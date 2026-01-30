@@ -220,25 +220,19 @@ def safe_hl_load_markets(ex: ccxt.Exchange, *, tries: int = 5) -> None:
 def make_ccxt_hl(*, user_addr: str) -> ccxt.Exchange:
     agent_addr = (os.getenv("HYPERLIQUID_API_WALLET_ADDRESS") or "").strip()
     pk = (os.getenv("HYPERLIQUID_PRIVATE_KEY") or "").strip()
-    if not pk:
-        raise SystemExit("Missing HYPERLIQUID_PRIVATE_KEY")
-    if agent_addr and not ADDR_RE.match(agent_addr):
-        raise SystemExit(f"Invalid HYPERLIQUID_API_WALLET_ADDRESS: {agent_addr!r}")
-    if not ADDR_RE.match(user_addr):
-        raise SystemExit(f"Invalid user wallet address: {user_addr!r}")
+    if not agent_addr or not pk:
+        raise SystemExit("Missing HYPERLIQUID_API_WALLET_ADDRESS / HYPERLIQUID_PRIVATE_KEY")
 
     print(f"[HL] user={user_addr} agent={agent_addr}")
 
     config: dict[str, object] = {
-        # IMPORTANT: walletAddress should be the *user/public* account
-        "walletAddress": user_addr,
-        # privateKey signs requests (your API/agent key)
-        "privateKey": pk,
+        "walletAddress": user_addr,   # ✅ user owns position
+        "privateKey": pk,             # ✅ agent signs
         "enableRateLimit": True,
         "timeout": 10000,
         "options": {
             "defaultType": "swap",
-            "defaultSlippage": 0.005,  # baseline; hl_with_slippage_retry will override per attempt
+            "defaultSlippage": 0.005,
             "fetchMarkets": {"hip3": {"dex": ["hyperliquid"]}},
             "broker": "",
             "skipApproveBuilderFee": True,
@@ -393,6 +387,7 @@ def main() -> int:
         print("[DRY] --live not set, stopping before trading calls.")
         return 0
 
+    user_addr = require_user(args.user)
     ex = make_ccxt_hl(user_addr=user_addr)
     load_markets_retry(ex)
 
@@ -442,7 +437,7 @@ def main() -> int:
     exit_side = "buy" if side_ccxt == "sell" else "sell"
 
     # -------------------
-    # 3) TP / SL (trigger-market reduce-only)
+    # 3) TP / SL
     # -------------------
     if foo1:
         print(f"[EXITS] open_orders={len(foo1)} detected; cancelling before placing SL/TP")
@@ -460,12 +455,10 @@ def main() -> int:
         price_hint=tp,
     )
     
-    ok_sl, msg_sl, _ = assert_hl_order(sl_o, name="SL", expect="OPEN")
-    ok_tp, msg_tp, _ = assert_hl_order(tp_o, name="TP", expect="OPEN")
-    print(msg_sl)
-    print(msg_tp)
-    
     sl_oid, tp_oid = _oid(sl_o), _oid(tp_o)
+    print(f"[SL] oid={sl_oid} filled={_filled(sl_o)}")
+    print(f"[TP] oid={tp_oid} filled={_filled(tp_o)}")
+    
     want = {x for x in (sl_oid, tp_oid) if x}
     ok_vis = wait_open_orders_contain(user_addr=user_addr, want_oids=want, timeout_s=2.5)
     print(f"[EXITS] visible_in_open_orders={ok_vis} want={sorted(list(want))}")
@@ -504,15 +497,9 @@ def main() -> int:
     flat = flatten_reduce_only(ex, sym_ccxt, exit_side, exit_qty, mid_now=mid_flat)
     ok_f, msg_f, _ = assert_hl_order(flat, name="FLATTEN", expect="FILLED")
     print(msg_f)
-    flat = ex.create_order(
-        sym_ccxt, "market", exit_side, exit_qty,
-        float(mid_now),
-        {"reduceOnly": True},
-    )
-    ok_f, msg_f, df = assert_hl_order(flat, name="FLATTEN", expect="FILLED")
-    print(msg_f)
 
-    time.sleep(1.0)
+    best_effort_cancel_all(ex, sym_ccxt)
+    time.sleep(0.5)
     pos2 = get_user_positions(user_addr, timeout=args.timeout)
     foo2 = get_frontend_open_orders(user_addr, timeout=args.timeout)
     print(f"[AFTER FLATTEN] positions_nonzero={len(pos2)} open_orders={len(foo2)}")
