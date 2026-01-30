@@ -239,6 +239,7 @@ def make_ccxt_hl(*, user_addr: str) -> ccxt.Exchange:
         },
     }
     ex = ccxt.hyperliquid(config)  # type: ignore[arg-type]
+    print(f"[HL] signer={agent_addr}")
     ex.verbose = False
     return ex
 
